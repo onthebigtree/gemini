@@ -547,89 +547,103 @@ async def safe_generate_handler(
             message=f"请求处理失败: {str(e)}"
         )
 
-@app.post("/generate", response_model=GenerateResponse)
-async def generate(
-    request: Request,
-    prompt: str = Form(..., description="文本提示词"),
-    model: Optional[str] = Form(None, description="可选，自定义模型名"),
-    image: Optional[UploadFile] = File(None, description="可选，上传的参考图片"),
-):
+@app.post("/generate")
+async def generate(request: Request):
     """
     智能生成接口
     支持纯文本生成和图文混合生成两种模式：
     - 不上传图片：纯文本生成  
     - 上传图片：图文混合生成
     
-    参数：
+    参数（通过 multipart/form-data）：
     - prompt: 文本提示词 (必填)
     - image: 图片文件 (可选)
     - model: 自定义模型名 (可选)
     """
-    logger.info(f"✅ /generate 接口被正常调用! 客户端: {request.client.host}")
-    logger.info(f"✅ 参数 - prompt: '{prompt}', model: '{model}'")
-    logger.info(f"✅ 图片参数: {type(image)}, filename: {getattr(image, 'filename', 'N/A')}")
+    logger.info(f"✅ /generate 接口被调用! 客户端: {request.client.host}")
     
     try:
-        # 先尝试使用 FastAPI 解析的参数
+        # 直接手动解析表单数据，避免 FastAPI 的自动验证
+        logger.info("🔍 开始手动解析表单数据...")
+        form_data = await request.form()
+        
+        logger.info(f"🔍 表单字段数量: {len(form_data)}")
+        logger.info(f"🔍 表单字段名: {list(form_data.keys())}")
+        
+        # 获取参数
+        prompt = form_data.get("prompt")
+        model = form_data.get("model", None)
+        
+        logger.info(f"✅ 解析到参数 - prompt: '{prompt}', model: '{model}'")
+        
+        if not prompt:
+            logger.error("❌ 缺少必填参数: prompt")
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "success": False,
+                    "model": MODEL_NAME,
+                    "prompt": "",
+                    "texts": [],
+                    "image_urls": [],
+                    "message": "缺少必填参数: prompt"
+                }
+            )
+        
         model_name = model or MODEL_NAME
         
-        # 智能处理图片参数
+        # 处理图片参数
         image_file = None
-        if is_valid_upload_file(image):
-            image_file = image
-            print(f"🖼️ 检测到有效图片上传: {image.filename}")
-        else:
-            print("📝 纯文本模式（无有效图片上传）")
-        
-        return await safe_generate_handler(request, prompt, model_name, image_file)
-        
-    except Exception as e:
-        # 如果 FastAPI 参数解析失败（比如类型错误），回退到手动解析
-        logger.warning(f"⚠️ FastAPI 参数解析失败，回退到手动解析: {e}")
-        logger.warning(f"⚠️ 异常类型: {type(e)}")
-        
-        try:
-            # 手动解析表单数据
-            form_data = await request.form()
+        if "image" in form_data:
+            potential_image = form_data["image"]
+            logger.info(f"🔍 检查 image 字段: 类型={type(potential_image)}, 值={repr(potential_image)}")
             
-            # 获取参数
-            manual_prompt = form_data.get("prompt")
-            if not manual_prompt:
-                return GenerateResponse(
-                    success=False,
-                    model=MODEL_NAME,
-                    prompt="",
-                    texts=[],
-                    image_urls=[],
-                    message="缺少必填参数: prompt"
-                )
-            
-            manual_model = form_data.get("model", None)
-            manual_model_name = manual_model or MODEL_NAME
-            
-            # 处理图片参数
-            manual_image_file = None
-            if "image" in form_data:
-                potential_image = form_data["image"]
-                if is_valid_upload_file(potential_image):
-                    manual_image_file = potential_image
-                    print(f"🖼️ 手动解析检测到有效图片上传: {potential_image.filename}")
-                else:
-                    print("📝 手动解析：纯文本模式（image字段为空或无效）")
+            if is_valid_upload_file(potential_image):
+                image_file = potential_image
+                logger.info(f"🖼️ 检测到有效图片上传: {potential_image.filename}")
             else:
-                print("📝 手动解析：纯文本模式（无image字段）")
+                logger.info("📝 纯文本模式（image字段为空或无效）")
+        else:
+            logger.info("📝 纯文本模式（无image字段）")
+        
+        # 调用处理函数
+        result = await safe_generate_handler(request, prompt, model_name, image_file)
+        
+        # 返回结果
+        if hasattr(result, 'dict'):
+            content = result.dict()
+        elif hasattr(result, 'model_dump'):
+            content = result.model_dump()
+        else:
+            # 手动构建响应
+            content = {
+                "success": getattr(result, 'success', True),
+                "model": getattr(result, 'model', model_name),
+                "prompt": getattr(result, 'prompt', prompt),
+                "texts": getattr(result, 'texts', []),
+                "image_urls": getattr(result, 'image_urls', []),
+                "message": getattr(result, 'message', "生成成功")
+            }
+        
+        return JSONResponse(status_code=200, content=content)
             
-            return await safe_generate_handler(request, manual_prompt, manual_model_name, manual_image_file)
-            
-        except Exception as manual_e:
-            return GenerateResponse(
-                success=False,
-                model=MODEL_NAME,
-                prompt="",
-                texts=[],
-                image_urls=[],
-                message=f"请求处理失败: {str(manual_e)}"
-            )
+    except Exception as e:
+        logger.error(f"💥 /generate 接口处理失败: {e}")
+        logger.error(f"💥 异常类型: {type(e)}")
+        import traceback
+        logger.error(f"💥 完整异常信息: {traceback.format_exc()}")
+        
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": False,
+                "model": MODEL_NAME,
+                "prompt": "",
+                "texts": [],
+                "image_urls": [],
+                "message": f"请求处理失败: {str(e)}"
+            }
+        )
 
 # 便捷的根路由
 @app.get("/")
