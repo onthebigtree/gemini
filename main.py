@@ -66,12 +66,41 @@ async def log_requests(request: Request, call_next):
     logger.info(f"📥 User-Agent: {request.headers.get('user-agent', 'unknown')}")
     logger.info(f"📥 Content-Type: {request.headers.get('content-type', 'unknown')}")
     
-    response = await call_next(request)
+    # 如果是 /generate 接口，尝试读取更多信息
+    if request.url.path == "/generate":
+        try:
+            # 尝试获取表单数据
+            logger.info("🔍 尝试预读取表单数据...")
+            body = await request.body()
+            logger.info(f"🔍 请求体大小: {len(body)} bytes")
+            logger.info(f"🔍 请求体前100字符: {body[:100]}")
+            
+            # 重新构造 request 以便后续处理
+            from starlette.requests import Request as StarletteRequest
+            scope = request.scope.copy()
+            
+            async def receive():
+                return {"type": "http.request", "body": body}
+            
+            request = StarletteRequest(scope, receive)
+        except Exception as e:
+            logger.error(f"🔍 预读取表单数据失败: {e}")
     
-    process_time = time.time() - start_time
-    logger.info(f"📤 响应: {response.status_code} | 处理时间: {process_time:.3f}s")
-    
-    return response
+    try:
+        response = await call_next(request)
+        process_time = time.time() - start_time
+        logger.info(f"📤 响应: {response.status_code} | 处理时间: {process_time:.3f}s")
+        
+        if response.status_code >= 400:
+            logger.error(f"📤 错误响应! 状态码: {response.status_code}")
+            
+        return response
+    except Exception as e:
+        process_time = time.time() - start_time
+        logger.error(f"💥 中间件捕获异常: {e}")
+        logger.error(f"💥 异常类型: {type(e)}")
+        logger.error(f"💥 处理时间: {process_time:.3f}s")
+        raise
 
 # CORS（按需调整） - 先添加中间件
 app.add_middleware(
@@ -91,23 +120,42 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     """
     全局异常处理器，专门处理 /generate 接口的 image 字段验证错误
     """
+    logger.error("=" * 50)
+    logger.error("🚨 REQUEST VALIDATION ERROR 详细信息")
+    logger.error("=" * 50)
     logger.error(f"🚨 请求验证错误! 客户端: {request.client.host}")
     logger.error(f"🚨 请求路径: {request.url.path}")
     logger.error(f"🚨 请求方法: {request.method}")
+    logger.error(f"🚨 完整URL: {request.url}")
     logger.error(f"🚨 请求头: {dict(request.headers)}")
     logger.error(f"🚨 错误详情: {exc.errors()}")
     
+    # 详细分析每个错误
+    for i, error in enumerate(exc.errors()):
+        logger.error(f"🚨 错误 #{i+1}:")
+        logger.error(f"   - 类型: {error.get('type')}")
+        logger.error(f"   - 位置: {error.get('loc')}")
+        logger.error(f"   - 消息: {error.get('msg')}")
+        logger.error(f"   - 输入值: {repr(error.get('input'))}")
+        logger.error(f"   - 上下文: {error.get('ctx')}")
+    
     # 尝试读取请求体信息
     try:
+        logger.error("🔍 尝试读取表单数据...")
         form_data = await request.form()
-        logger.error(f"🚨 表单数据: {dict(form_data)}")
+        logger.error(f"🚨 表单数据字段数量: {len(form_data)}")
+        logger.error(f"🚨 表单数据字段名: {list(form_data.keys())}")
+        
         for key, value in form_data.items():
             if hasattr(value, 'filename'):
-                logger.error(f"🚨 文件字段 {key}: filename={value.filename}, content_type={getattr(value, 'content_type', 'unknown')}")
+                logger.error(f"🚨 文件字段 {key}: filename='{value.filename}', content_type='{getattr(value, 'content_type', 'unknown')}', size={getattr(value, 'size', 'unknown')}")
             else:
-                logger.error(f"🚨 文本字段 {key}: {value}")
+                logger.error(f"🚨 文本字段 {key}: '{value}' (类型: {type(value)})")
     except Exception as e:
         logger.error(f"🚨 无法读取表单数据: {e}")
+        logger.error(f"🚨 表单读取异常类型: {type(e)}")
+    
+    logger.error("=" * 50)
     
     # 检查是否是 /generate 接口的 image 字段错误
     # 注意：error.get("loc") 可能是元组或列表
