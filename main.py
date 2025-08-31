@@ -4,7 +4,9 @@ from io import BytesIO
 from typing import List, Optional
 import mimetypes
 
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Request
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Request, Depends, Body
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -45,10 +47,7 @@ class GenerateResponse(BaseModel):
 # ---------- App ----------
 app = FastAPI(title="Gemini Image Gen FastAPI", version="1.0.0")
 
-# 挂载静态文件以便访问生成的图片
-app.mount("/static", StaticFiles(directory=GENERATED_DIR), name="static")
-
-# CORS（按需调整）
+# CORS（按需调整） - 先添加中间件
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -56,6 +55,123 @@ app.add_middleware(
     allow_methods=["POST", "GET", "OPTIONS"],
     allow_headers=["*"],
 )
+
+# 挂载静态文件以便访问生成的图片
+app.mount("/static", StaticFiles(directory=GENERATED_DIR), name="static")
+
+# ---------- Exception Handlers ----------
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """
+    全局异常处理器，专门处理 /generate 接口的 image 字段验证错误
+    """
+    print(f"🚨 异常处理器被触发! 路径: {request.url.path}")
+    print(f"🚨 错误详情: {exc.errors()}")
+    
+    # 检查是否是 /generate 接口的 image 字段错误
+    # 注意：error.get("loc") 可能是元组或列表
+    if (request.url.path == "/generate" and 
+        any(error.get("loc") in [("body", "image"), ["body", "image"]] for error in exc.errors())):
+        
+        print("🔄 检测到 image 字段验证错误，回退到手动处理...")
+        
+        try:
+            # 手动解析表单数据
+            form_data = await request.form()
+            
+            # 获取参数
+            prompt = form_data.get("prompt")
+            if not prompt:
+                return JSONResponse(
+                    status_code=200,
+                    content={
+                        "success": False,
+                        "model": MODEL_NAME,
+                        "prompt": "",
+                        "texts": [],
+                        "image_urls": [],
+                        "message": "缺少必填参数: prompt"
+                    }
+                )
+            
+            model = form_data.get("model", None)
+            model_name = model or MODEL_NAME
+            
+            # 处理图片参数
+            image_file = None
+            if "image" in form_data:
+                potential_image = form_data["image"]
+                if is_valid_upload_file(potential_image):
+                    image_file = potential_image
+                    print(f"🖼️ 异常处理器检测到有效图片: {potential_image.filename}")
+                else:
+                    print("📝 异常处理器：纯文本模式（image字段为空或无效）")
+            else:
+                print("📝 异常处理器：纯文本模式（无image字段）")
+            
+            # 调用处理函数
+            result = await safe_generate_handler(request, prompt, model_name, image_file)
+            
+            # 安全地转换为字典
+            if hasattr(result, 'dict'):
+                content = result.dict()
+            elif hasattr(result, 'model_dump'):
+                content = result.model_dump()
+            else:
+                # 手动构建响应
+                content = {
+                    "success": getattr(result, 'success', True),
+                    "model": getattr(result, 'model', model_name),
+                    "prompt": getattr(result, 'prompt', prompt),
+                    "texts": getattr(result, 'texts', []),
+                    "image_urls": getattr(result, 'image_urls', []),
+                    "message": getattr(result, 'message', "生成成功")
+                }
+            
+            # 转换为 JSONResponse
+            return JSONResponse(
+                status_code=200,
+                content=content
+            )
+            
+        except Exception as e:
+            print(f"🚨 异常处理器内部错误: {e}")
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "success": False,
+                    "model": MODEL_NAME,
+                    "prompt": "",
+                    "texts": [],
+                    "image_urls": [],
+                    "message": f"异常处理器处理失败: {str(e)}"
+                }
+            )
+    
+    # 对于其他验证错误，返回标准错误响应
+    print(f"🚨 非 /generate 接口错误或非 image 字段错误，返回标准错误")
+    # 安全地处理错误信息，避免 JSON 序列化问题
+    try:
+        error_details = []
+        for error in exc.errors():
+            safe_error = {
+                "type": error.get("type", "unknown"),
+                "loc": error.get("loc", []),
+                "msg": str(error.get("msg", "Validation error")),
+                "input": str(error.get("input", ""))
+            }
+            error_details.append(safe_error)
+        
+        return JSONResponse(
+            status_code=422,
+            content={"detail": error_details}
+        )
+    except Exception:
+        # 如果还是有问题，返回简化的错误信息
+        return JSONResponse(
+            status_code=422,
+            content={"detail": [{"type": "validation_error", "msg": "Request validation failed"}]}
+        )
 
 # ---------- Client ----------
 if not API_KEY:
@@ -184,47 +300,34 @@ async def upload_image(
             message=f"上传失败: {str(e)}"
         )
 
-@app.post("/generate", response_model=GenerateResponse)
-async def generate(
+async def _process_generate_request(
     request: Request,
-    prompt: str = Form(..., description="文本提示词"),
-    model: Optional[str] = Form(None, description="可选，自定义模型名，默认使用 gemini-2.5-flash-image-preview"),
-):
-    """
-    智能生成接口
-    支持纯文本生成和图文混合生成两种模式：
-    - 不上传图片：纯文本生成
-    - 上传图片：图文混合生成
-    """
+    prompt: str,
+    model_name: str,
+    image_file = None
+) -> GenerateResponse:
+    """处理生成请求的内部函数"""
     try:
-        # 选择模型
-        model_name = model or MODEL_NAME
-
         # 初始化客户端
         client = get_client()
 
-        # 准备内容 - 从 request.form() 中获取所有数据
-        form_data = await request.form()
+        # 准备内容
         contents = [prompt]
         
-        # 检查是否有图片上传
-        if "image" in form_data:
-            image_file = form_data["image"]
-            # 检查是否是有效的文件上传
-            if hasattr(image_file, 'filename') and image_file.filename and image_file.filename.strip():
-                try:
-                    # 创建临时的 UploadFile 对象来复用现有的处理逻辑
-                    pil_img = pil_from_upload(image_file)
-                    contents.append(pil_img)
-                except Exception as e:
-                    return GenerateResponse(
-                        success=False,
-                        model=model_name,
-                        prompt=prompt,
-                        texts=[],
-                        image_urls=[],
-                        message=f"图片处理失败: {str(e)}"
-                    )
+        # 如果有图片，添加到内容中
+        if image_file and hasattr(image_file, 'filename') and image_file.filename and image_file.filename.strip():
+            try:
+                pil_img = pil_from_upload(image_file)
+                contents.append(pil_img)
+            except Exception as e:
+                return GenerateResponse(
+                    success=False,
+                    model=model_name,
+                    prompt=prompt,
+                    texts=[],
+                    image_urls=[],
+                    message=f"图片处理失败: {str(e)}"
+                )
 
         # 调用生成
         try:
@@ -294,15 +397,57 @@ async def generate(
             message=f"{mode}成功"
         )
 
-    except HTTPException as e:
+    except Exception as e:
         return GenerateResponse(
             success=False,
-            model=model or MODEL_NAME,
+            model=model_name,
             prompt=prompt,
             texts=[],
             image_urls=[],
-            message=e.detail
+            message=f"请求处理失败: {str(e)}"
         )
+
+def is_valid_upload_file(image) -> bool:
+    """检查是否是有效的文件上传"""
+    if image is None:
+        return False
+    
+    # 检查是否是字符串（FastAPI bug 情况）
+    if isinstance(image, str):
+        return False
+    
+    # 检查是否有 filename 属性
+    if not hasattr(image, 'filename'):
+        return False
+    
+    # 检查文件名是否有效
+    if not image.filename or not image.filename.strip() or image.filename == "":
+        return False
+    
+    return True
+
+async def safe_generate_handler(
+    request: Request,
+    prompt: str,
+    model: Optional[str] = None,
+    image: Optional[UploadFile] = None,
+):
+    """安全的生成处理函数，处理可选文件上传的各种情况"""
+    try:
+        model_name = model or MODEL_NAME
+        
+        # 智能处理图片参数
+        image_file = None
+        
+        # 只有在确实有有效文件上传时才使用图片
+        if is_valid_upload_file(image):
+            image_file = image
+            print(f"🖼️ 检测到有效图片上传: {image.filename}")
+        else:
+            print("📝 纯文本模式（无有效图片上传）")
+        
+        return await _process_generate_request(request, prompt, model_name, image_file)
+        
     except Exception as e:
         return GenerateResponse(
             success=False,
@@ -312,6 +457,85 @@ async def generate(
             image_urls=[],
             message=f"请求处理失败: {str(e)}"
         )
+
+@app.post("/generate", response_model=GenerateResponse)
+async def generate(
+    request: Request,
+    prompt: str = Form(..., description="文本提示词"),
+    model: Optional[str] = Form(None, description="可选，自定义模型名"),
+    image: Optional[UploadFile] = File(None, description="可选，上传的参考图片"),
+):
+    """
+    智能生成接口
+    支持纯文本生成和图文混合生成两种模式：
+    - 不上传图片：纯文本生成  
+    - 上传图片：图文混合生成
+    
+    参数：
+    - prompt: 文本提示词 (必填)
+    - image: 图片文件 (可选)
+    - model: 自定义模型名 (可选)
+    """
+    try:
+        # 先尝试使用 FastAPI 解析的参数
+        model_name = model or MODEL_NAME
+        
+        # 智能处理图片参数
+        image_file = None
+        if is_valid_upload_file(image):
+            image_file = image
+            print(f"🖼️ 检测到有效图片上传: {image.filename}")
+        else:
+            print("📝 纯文本模式（无有效图片上传）")
+        
+        return await safe_generate_handler(request, prompt, model_name, image_file)
+        
+    except Exception as e:
+        # 如果 FastAPI 参数解析失败（比如类型错误），回退到手动解析
+        print(f"⚠️ FastAPI 参数解析失败，回退到手动解析: {e}")
+        
+        try:
+            # 手动解析表单数据
+            form_data = await request.form()
+            
+            # 获取参数
+            manual_prompt = form_data.get("prompt")
+            if not manual_prompt:
+                return GenerateResponse(
+                    success=False,
+                    model=MODEL_NAME,
+                    prompt="",
+                    texts=[],
+                    image_urls=[],
+                    message="缺少必填参数: prompt"
+                )
+            
+            manual_model = form_data.get("model", None)
+            manual_model_name = manual_model or MODEL_NAME
+            
+            # 处理图片参数
+            manual_image_file = None
+            if "image" in form_data:
+                potential_image = form_data["image"]
+                if is_valid_upload_file(potential_image):
+                    manual_image_file = potential_image
+                    print(f"🖼️ 手动解析检测到有效图片上传: {potential_image.filename}")
+                else:
+                    print("📝 手动解析：纯文本模式（image字段为空或无效）")
+            else:
+                print("📝 手动解析：纯文本模式（无image字段）")
+            
+            return await safe_generate_handler(request, manual_prompt, manual_model_name, manual_image_file)
+            
+        except Exception as manual_e:
+            return GenerateResponse(
+                success=False,
+                model=MODEL_NAME,
+                prompt="",
+                texts=[],
+                image_urls=[],
+                message=f"请求处理失败: {str(manual_e)}"
+            )
 
 # 便捷的根路由
 @app.get("/")
@@ -338,10 +562,11 @@ def index():
                 "method": "POST",
                 "path": "/generate",
                 "description": "智能生成接口，自动识别模式",
+                "content_type": "multipart/form-data",
                 "parameters": {
-                    "prompt": "文本提示词 (必填)",
-                    "image": "可选，参考图片文件",
-                    "model": "可选，自定义模型名"
+                    "prompt": "文本提示词 (必填，form字段)",
+                    "image": "可选，参考图片文件 (form字段，文件类型)",
+                    "model": "可选，自定义模型名 (form字段)"
                 },
                 "response": {
                     "success": "boolean",
@@ -351,10 +576,22 @@ def index():
                     "image_urls": "array of strings (完整访问链接)",
                     "message": "string (包含生成模式信息)"
                 },
-                "modes": {
-                    "text_only": "只传 prompt → 纯文本生成",
-                    "image_text": "传 prompt + image → 图文混合生成"
-                }
+                "usage": {
+                    "text_only": "curl -F 'prompt=你的文本' http://localhost:8000/generate",
+                    "with_image": "curl -F 'prompt=描述图片' -F 'image=@image.jpg' http://localhost:8000/generate"
+                },
+                "logic": {
+                    "no_image": "不传image字段或传空文件 → 纯文本生成",
+                    "with_image": "传有效图片文件 → 图文混合生成"
+                },
+                "swagger_usage": {
+                    "step1": "在 Swagger UI 中点击 'Try it out'",
+                    "step2": "填写 prompt 参数（必填）",
+                    "step3": "可选填写 model 参数", 
+                    "step4": "可选上传 image 文件（直接在 image 字段选择文件）",
+                    "step5": "点击 Execute 执行"
+                },
+                "note": "现在所有参数都在 Swagger UI 中可见，包括 image 文件上传"
             },
             "health": {
                 "method": "GET",
