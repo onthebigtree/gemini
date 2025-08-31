@@ -597,20 +597,31 @@ async def generate(request: Request):
                         name_match = re.search(r'name="([^"]+)"', part)
                         if name_match:
                             field_name = name_match.group(1)
-                            # 提取字段值（在空行之后）
-                            lines = part.split('\r\n')
-                            content_start = False
-                            field_value = ""
-                            for line in lines:
-                                if content_start:
-                                    if line.startswith('--'):
-                                        break
-                                    field_value += line
-                                elif line == "":
-                                    content_start = True
                             
-                            fields[field_name] = field_value.strip()
-                            logger.info(f"🔍 解析字段: {field_name} = '{field_value.strip()}'")
+                            # 找到头部和内容的分界线（空行）
+                            if '\r\n\r\n' in part:
+                                # 分割头部和内容
+                                header_part, content_part = part.split('\r\n\r\n', 1)
+                                # 获取纯内容（去掉可能的尾部boundary）
+                                field_value = content_part.split('\r\n--')[0].strip()
+                            else:
+                                # 备用解析方法
+                                lines = part.split('\r\n')
+                                content_lines = []
+                                found_empty_line = False
+                                
+                                for line in lines:
+                                    if found_empty_line:
+                                        if line.startswith('--'):
+                                            break
+                                        content_lines.append(line)
+                                    elif line == "":
+                                        found_empty_line = True
+                                
+                                field_value = '\r\n'.join(content_lines).strip()
+                            
+                            fields[field_name] = field_value
+                            logger.info(f"🔍 解析字段: {field_name} = '{field_value}'")
                 
                 # 使用解析的字段
                 prompt = fields.get("prompt")
