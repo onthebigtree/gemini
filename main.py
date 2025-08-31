@@ -1,8 +1,10 @@
 import os
 import uuid
+import time
 from io import BytesIO
 from typing import List, Optional
 import mimetypes
+import logging
 
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Request, Depends, Body
 from fastapi.exceptions import RequestValidationError
@@ -19,6 +21,13 @@ from google import genai
 
 # 加载 .env 文件
 load_dotenv()
+
+# ---------- Logging ----------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # ---------- Config ----------
 API_KEY = os.getenv("GOOGLE_API_KEY")  # 在环境变量里设置
@@ -47,6 +56,23 @@ class GenerateResponse(BaseModel):
 # ---------- App ----------
 app = FastAPI(title="Gemini Image Gen FastAPI", version="1.0.0")
 
+# ---------- Request Logging Middleware ----------
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start_time = time.time()
+    
+    logger.info(f"📥 收到请求: {request.method} {request.url.path}")
+    logger.info(f"📥 客户端: {request.client.host}:{request.client.port}")
+    logger.info(f"📥 User-Agent: {request.headers.get('user-agent', 'unknown')}")
+    logger.info(f"📥 Content-Type: {request.headers.get('content-type', 'unknown')}")
+    
+    response = await call_next(request)
+    
+    process_time = time.time() - start_time
+    logger.info(f"📤 响应: {response.status_code} | 处理时间: {process_time:.3f}s")
+    
+    return response
+
 # CORS（按需调整） - 先添加中间件
 app.add_middleware(
     CORSMiddleware,
@@ -65,15 +91,30 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     """
     全局异常处理器，专门处理 /generate 接口的 image 字段验证错误
     """
-    print(f"🚨 异常处理器被触发! 路径: {request.url.path}")
-    print(f"🚨 错误详情: {exc.errors()}")
+    logger.error(f"🚨 请求验证错误! 客户端: {request.client.host}")
+    logger.error(f"🚨 请求路径: {request.url.path}")
+    logger.error(f"🚨 请求方法: {request.method}")
+    logger.error(f"🚨 请求头: {dict(request.headers)}")
+    logger.error(f"🚨 错误详情: {exc.errors()}")
+    
+    # 尝试读取请求体信息
+    try:
+        form_data = await request.form()
+        logger.error(f"🚨 表单数据: {dict(form_data)}")
+        for key, value in form_data.items():
+            if hasattr(value, 'filename'):
+                logger.error(f"🚨 文件字段 {key}: filename={value.filename}, content_type={getattr(value, 'content_type', 'unknown')}")
+            else:
+                logger.error(f"🚨 文本字段 {key}: {value}")
+    except Exception as e:
+        logger.error(f"🚨 无法读取表单数据: {e}")
     
     # 检查是否是 /generate 接口的 image 字段错误
     # 注意：error.get("loc") 可能是元组或列表
     if (request.url.path == "/generate" and 
         any(error.get("loc") in [("body", "image"), ["body", "image"]] for error in exc.errors())):
         
-        print("🔄 检测到 image 字段验证错误，回退到手动处理...")
+        logger.info("🔄 检测到 image 字段验证错误，回退到手动处理...")
         
         try:
             # 手动解析表单数据
@@ -476,6 +517,10 @@ async def generate(
     - image: 图片文件 (可选)
     - model: 自定义模型名 (可选)
     """
+    logger.info(f"✅ /generate 接口被正常调用! 客户端: {request.client.host}")
+    logger.info(f"✅ 参数 - prompt: '{prompt}', model: '{model}'")
+    logger.info(f"✅ 图片参数: {type(image)}, filename: {getattr(image, 'filename', 'N/A')}")
+    
     try:
         # 先尝试使用 FastAPI 解析的参数
         model_name = model or MODEL_NAME
@@ -492,7 +537,8 @@ async def generate(
         
     except Exception as e:
         # 如果 FastAPI 参数解析失败（比如类型错误），回退到手动解析
-        print(f"⚠️ FastAPI 参数解析失败，回退到手动解析: {e}")
+        logger.warning(f"⚠️ FastAPI 参数解析失败，回退到手动解析: {e}")
+        logger.warning(f"⚠️ 异常类型: {type(e)}")
         
         try:
             # 手动解析表单数据
