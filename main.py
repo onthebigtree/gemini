@@ -563,8 +563,123 @@ async def generate(request: Request):
     logger.info(f"✅ /generate 接口被调用! 客户端: {request.client.host}")
     
     try:
-        # 直接手动解析表单数据，避免 FastAPI 的自动验证
-        logger.info("🔍 开始手动解析表单数据...")
+        # 检查 Content-Type
+        content_type = request.headers.get("content-type", "")
+        logger.info(f"🔍 Content-Type: {content_type}")
+        
+        # 如果是 multipart/form-data 但缺少 boundary，尝试手动解析
+        if content_type.startswith("multipart/form-data") and "boundary=" not in content_type:
+            logger.warning("⚠️ multipart/form-data 缺少 boundary 参数，尝试手动解析...")
+            
+            # 读取原始请求体
+            body = await request.body()
+            body_str = body.decode('utf-8', errors='ignore')
+            
+            logger.info(f"🔍 原始请求体: {body_str[:500]}...")
+            
+            # 尝试提取 boundary
+            if body_str.startswith('--'):
+                first_line = body_str.split('\r\n')[0]
+                boundary = first_line[2:]  # 去掉前面的 --
+                logger.info(f"🔍 提取到的 boundary: {boundary}")
+                
+                # 重新设置正确的 Content-Type
+                import re
+                
+                # 解析字段
+                fields = {}
+                
+                # 分割各个字段
+                parts = body_str.split(f'--{boundary}')
+                for part in parts:
+                    if 'Content-Disposition: form-data' in part:
+                        # 提取字段名
+                        name_match = re.search(r'name="([^"]+)"', part)
+                        if name_match:
+                            field_name = name_match.group(1)
+                            # 提取字段值（在空行之后）
+                            lines = part.split('\r\n')
+                            content_start = False
+                            field_value = ""
+                            for line in lines:
+                                if content_start:
+                                    if line.startswith('--'):
+                                        break
+                                    field_value += line
+                                elif line == "":
+                                    content_start = True
+                            
+                            fields[field_name] = field_value.strip()
+                            logger.info(f"🔍 解析字段: {field_name} = '{field_value.strip()}'")
+                
+                # 使用解析的字段
+                prompt = fields.get("prompt")
+                model = fields.get("model", None)
+                
+                logger.info(f"✅ 手动解析到参数 - prompt: '{prompt}', model: '{model}'")
+                
+                if not prompt:
+                    logger.error("❌ 缺少必填参数: prompt")
+                    return JSONResponse(
+                        status_code=200,
+                        content={
+                            "success": False,
+                            "model": MODEL_NAME,
+                            "prompt": "",
+                            "texts": [],
+                            "image_urls": [],
+                            "message": "缺少必填参数: prompt"
+                        }
+                    )
+                
+                model_name = model or MODEL_NAME
+                
+                # 处理图片参数（手动解析的情况下，如果 image 字段为空字符串，就是纯文本）
+                image_file = None
+                image_value = fields.get("image", "")
+                if image_value and image_value.strip():
+                    logger.info(f"🖼️ 检测到图片字段（但手动解析无法处理文件）: {image_value}")
+                    # 手动解析模式下，暂时不支持图片上传
+                    logger.info("📝 手动解析模式：纯文本模式")
+                else:
+                    logger.info("📝 手动解析模式：纯文本模式（无image字段或为空）")
+                
+                # 调用处理函数
+                result = await safe_generate_handler(request, prompt, model_name, None)  # 手动解析模式暂不支持图片
+                
+                # 返回结果
+                if hasattr(result, 'dict'):
+                    content = result.dict()
+                elif hasattr(result, 'model_dump'):
+                    content = result.model_dump()
+                else:
+                    content = {
+                        "success": getattr(result, 'success', True),
+                        "model": getattr(result, 'model', model_name),
+                        "prompt": getattr(result, 'prompt', prompt),
+                        "texts": getattr(result, 'texts', []),
+                        "image_urls": getattr(result, 'image_urls', []),
+                        "message": getattr(result, 'message', "生成成功")
+                    }
+                
+                return JSONResponse(status_code=200, content=content)
+            
+            else:
+                logger.error("❌ 无法解析 multipart 数据：找不到 boundary")
+                return JSONResponse(
+                    status_code=200,
+                    content={
+                        "success": False,
+                        "model": MODEL_NAME,
+                        "prompt": "",
+                        "texts": [],
+                        "image_urls": [],
+                        "message": "无法解析请求：multipart/form-data 格式错误"
+                    }
+                )
+        
+        # 正常的 multipart/form-data 处理
+        logger.info("🔍 开始正常解析表单数据...")
         form_data = await request.form()
         
         logger.info(f"🔍 表单字段数量: {len(form_data)}")
